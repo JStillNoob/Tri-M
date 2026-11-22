@@ -1,0 +1,4 @@
+{
+  "oxc.enable": false,
+  "eslint.workingDirectories": ["./tri_m-frontend"]
+}

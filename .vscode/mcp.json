@@ -1,0 +1,20 @@
+
+{
+  "servers": {
+    "preline": {
+      "type": "http",
+      "url": "https://mcp.preline.co",
+      "headers": {
+        "Authorization": "Bearer ${input:preline-api-key}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "preline-api-key",
+      "description": "Preline API key",
+      "password": true
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "name": "tri_m-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "run-s \"lint:*\"",
+    "lint:oxlint": "oxlint . --fix",
+    "lint:eslint": "eslint . --fix --cache",
+    "format": "oxfmt src/"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.75.0",
+    "@phosphor-icons/vue": "^2.2.1",
+    "axios": "^1.21.1",
+    "fflate": "^0.8.3",
+    "pinia": "^4.0.3",
+    "read-excel-file": "^9.3.17",
+    "vue": "^3.5.42",
+    "vue-router": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-oxlint": "~1.82.0",
+    "eslint-plugin-vue": "~10.11.0",
+    "globals": "^17.12.0",
+    "npm-run-all2": "^8.0.4",
+    "oxfmt": "^0.67.0",
+    "oxlint": "~1.82.0",
+    "tailwindcss": "^4.3.5",
+    "vite": "^6.4.6",
+    "vite-plugin-vue-devtools": "^7.7.10",
+    "vue-eslint-parser": "^10.4.1"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.12.0"
+  }
+}

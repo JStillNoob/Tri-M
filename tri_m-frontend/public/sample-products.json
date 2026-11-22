@@ -1,0 +1,37 @@
+{
+  "categories": ["Snack", "Food", "Drink", "Fruits"],
+  "products": [
+    {
+      "sku": "RAMEN-01",
+      "name": "Noodles Ramen",
+      "category": "Food",
+      "priceCentavos": 5350,
+      "costCentavos": 3800,
+      "stock": 8
+    },
+    {
+      "sku": "DUMPLINGS-01",
+      "name": "Dumplings",
+      "category": "Snack",
+      "priceCentavos": 3270,
+      "costCentavos": 2100,
+      "stock": 2
+    },
+    {
+      "sku": "BURGER-01",
+      "name": "Beef Burger",
+      "category": "Food",
+      "priceCentavos": 4500,
+      "costCentavos": 3200,
+      "stock": 5
+    },
+    {
+      "sku": "PIZZA-01",
+      "name": "Pizza Sicilia",
+      "category": "Food",
+      "priceCentavos": 8990,
+      "costCentavos": 6200,
+      "stock": 0
+    }
+  ]
+}
