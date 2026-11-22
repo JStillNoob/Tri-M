@@ -2,12 +2,14 @@
 
 use App\Models\Role;
 use App\Models\User;
+use App\Services\InventoryImportStorage;
 use App\Services\SupplierStockImports;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\Facades\Validator;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
@@ -62,8 +64,37 @@ Artisan::command('pos:user {email} {role} {first_name} {last_name} {--middle-nam
     return 0;
 })->purpose('Create an owner or cashier account');
 
-Artisan::command('pos:prune-imports', function (SupplierStockImports $imports): void {
-    $imports->prune();
-})->purpose('Remove expired inventory workbooks');
+Artisan::command('pos:prune-imports {--dry-run : List files eligible for deletion}', function (SupplierStockImports $imports, InventoryImportStorage $storage): int {
+    $disk = $storage->diskName();
+    $bucket = $disk === 'local' ? 'None (local filesystem)' : (config("filesystems.disks.$disk.bucket") ?: 'Not configured');
+    $this->line("Storage disk: $disk");
+    $this->line('Storage bucket: '.OutputFormatter::escape($bucket));
+
+    if ($this->option('dry-run')) {
+        $preview = $imports->previewPrune();
+        foreach ($preview['files'] as $path => $reason) {
+            $this->line(OutputFormatter::escape($path).'  '.$reason);
+        }
+        $this->info('File deletion candidates: '.count($preview['files']));
+        $this->line('Expired database preview records: '.$preview['expired_previews']);
+        $this->info('Dry run complete.');
+
+        return 0;
+    }
+
+    $failed = $imports->prune();
+    foreach ($failed as $path) {
+        $this->error('Deletion failed: '.OutputFormatter::escape($path));
+    }
+    if ($failed !== []) {
+        $this->error('Files with failed deletion attempts: '.count($failed));
+
+        return 1;
+    }
+
+    $this->info('Import cleanup complete.');
+
+    return 0;
+})->purpose('Remove expired import drafts and unreferenced inventory workbooks');
 
 Schedule::command('pos:prune-imports')->daily();

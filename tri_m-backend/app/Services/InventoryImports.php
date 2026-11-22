@@ -22,13 +22,21 @@ class InventoryImports
     public function confirm(User $owner, string $id): array
     {
         return $this->drafts->lock($id, function () use ($owner, $id): array {
-            $result = DB::transaction(function () use ($owner, $id): array {
+            $confirmed = InventoryImport::whereNull('status')->where('user_id', $owner->id)->whereNotNull('confirmed_at')->find($id);
+            if ($confirmed !== null) {
+                $this->drafts->forget($id);
+
+                return $confirmed->result;
+            }
+
+            $draft = $this->drafts->find($id);
+            $result = DB::transaction(function () use ($owner, $id, $draft): array {
                 $existing = InventoryImport::query()->whereNull('status')->where('user_id', $owner->id)->lockForUpdate()->find($id);
                 if ($existing?->confirmed_at !== null) {
                     return $existing->result;
                 }
 
-                $draft = $this->drafts->find($id) ?? $existing;
+                $draft ??= $existing;
                 abort_unless($draft !== null && $draft->status === null && $draft->user_id === $owner->id, 404);
                 abort_if($draft->expires_at->isPast(), 410, 'This preview expired. Upload the workbook again.');
                 $import = $existing ?? new InventoryImport;

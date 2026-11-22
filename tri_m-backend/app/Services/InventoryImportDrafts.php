@@ -4,19 +4,21 @@ namespace App\Services;
 
 use App\Models\InventoryImport;
 use App\Models\InventoryImportRow;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Filesystem\Filesystem;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
+use Throwable;
 
 class InventoryImportDrafts
 {
-    public function __construct(private Filesystem $files) {}
+    public function __construct(private Filesystem $files, private InventoryImportStorage $storage) {}
 
-    public function create(array $data): InventoryImport
+    public function create(array $data, ?string $id = null): InventoryImport
     {
         $batch = new InventoryImport($data);
-        $batch->forceFill(['id' => (string) Str::orderedUuid(), 'created_at' => now()]);
+        $batch->forceFill(['id' => $id ?? (string) Str::orderedUuid(), 'created_at' => now()]);
         $batch->setRelation('rows', new Collection);
         $this->save($batch);
 
@@ -26,17 +28,31 @@ class InventoryImportDrafts
     public function save(InventoryImport $batch): void
     {
         $batch->updated_at = now();
-        $disk = Storage::disk('local');
-        $disk->makeDirectory('inventory-drafts');
-        $this->files->replace($disk->path("inventory-drafts/{$batch->id}.json"), json_encode([
+        $disk = $this->storage->disk();
+        $path = "inventory-drafts/{$batch->id}.json";
+        $data = json_encode([
             'batch' => $batch->getAttributes(),
             'rows' => $batch->getRelation('rows')->map(fn (InventoryImportRow $row) => $row->getAttributes())->all(),
-        ], JSON_THROW_ON_ERROR), 0600);
+        ], JSON_THROW_ON_ERROR);
+
+        if ($this->storage->usesSupabase()) {
+            abort_unless($disk->put($path, $data, $this->storage->writeOptions()), 503, 'The import draft could not be saved. Try again.');
+
+            return;
+        }
+
+        $disk->makeDirectory('inventory-drafts');
+        $this->files->replace($disk->path($path), $data, 0600);
     }
 
     public function find(string $id): ?InventoryImport
     {
-        $json = Storage::disk('local')->get("inventory-drafts/$id.json");
+        $disk = $this->storage->disk();
+        $path = "inventory-drafts/$id.json";
+        if ($this->storage->usesSupabase() && ! $disk->fileExists($path)) {
+            return null;
+        }
+        $json = $disk->get($path);
         if ($json === null) {
             return null;
         }
@@ -49,7 +65,7 @@ class InventoryImportDrafts
 
     public function all(): iterable
     {
-        foreach (Storage::disk('local')->files('inventory-drafts') as $path) {
+        foreach ($this->storage->disk()->files('inventory-drafts') as $path) {
             $id = pathinfo($path, PATHINFO_FILENAME);
             if (Str::isUuid($id) && ($batch = $this->find($id)) !== null) {
                 yield $batch;
@@ -57,26 +73,46 @@ class InventoryImportDrafts
         }
     }
 
-    public function forget(string $id): void
+    public function metadataPaths(string $id): array
     {
-        Storage::disk('local')->delete(["inventory-drafts/$id.json", "inventory-drafts/confirmations/$id"]);
+        return ["inventory-drafts/confirmations/$id", "inventory-drafts/$id.json"];
     }
 
-    public function markConfirmationStarted(string $id): void
+    public function forget(string $id): ?string
     {
-        abort_unless(Storage::disk('local')->put("inventory-drafts/confirmations/$id", '1'), 503, 'The confirmation could not be started. Try again.');
-    }
+        foreach ($this->metadataPaths($id) as $path) {
+            if (! $this->storage->tryDelete($path)) {
+                return $path;
+            }
+        }
 
-    public function confirmationStarted(string $id): bool
-    {
-        return Storage::disk('local')->exists("inventory-drafts/confirmations/$id");
+        return null;
     }
 
     public function lock(string $id, callable $action): mixed
     {
-        $disk = Storage::disk('local');
-        $disk->makeDirectory('inventory-drafts/locks');
+        if ($this->storage->usesSupabase()) {
+            $lock = Cache::store('database')->lock('pos-import-draft:'.strtolower($id), 300);
+            try {
+                $lock->block(5);
+            } catch (LockTimeoutException) {
+                abort(503, 'The import draft is busy. Try again.');
+            }
+
+            try {
+                return $action();
+            } finally {
+                try {
+                    $lock->release();
+                } catch (Throwable $exception) {
+                    report($exception);
+                }
+            }
+        }
+
         $bucket = substr(hash('sha256', $id), 0, 2);
+        $disk = $this->storage->disk();
+        $disk->makeDirectory('inventory-drafts/locks');
         $handle = fopen($disk->path("inventory-drafts/locks/$bucket"), 'c');
         abort_if($handle === false, 503, 'The import draft could not be opened. Try again.');
         try {

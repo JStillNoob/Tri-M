@@ -8,12 +8,12 @@ use App\Models\InventoryImportRow;
 use App\Models\Product;
 use App\Models\User;
 use Brick\Math\BigDecimal;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Throwable;
@@ -24,17 +24,18 @@ class SupplierStockImports
         private SupplierWorkbook $workbook,
         private Inventory $inventory,
         private InventoryImportDrafts $drafts,
+        private InventoryImportStorage $storage,
     ) {}
 
     public function upload(User $owner, UploadedFile $file, bool $autoReview = false): array
     {
         $workbook = $this->workbook->inspect($file->getPathname());
-        $path = $file->store('inventory-workbooks', 'local');
-        if ($path === false) {
-            abort(503, 'The workbook could not be stored. Try again.');
-        }
-        try {
-            $batch = $this->drafts->create([
+        $id = (string) Str::orderedUuid();
+        $path = InventoryImportStorage::DRAFT_DIRECTORY."/{$id}.xlsx";
+        $batch = $this->drafts->lock($id, function () use ($owner, $file, $workbook, $id, $path): InventoryImport {
+            $this->storage->saveWorkbook($file, $path);
+
+            return $this->drafts->create([
                 'user_id' => $owner->id,
                 'file_name' => mb_substr($file->getClientOriginalName(), 0, 255),
                 'file_path' => $path,
@@ -42,12 +43,8 @@ class SupplierStockImports
                 'status' => 'uploaded',
                 'preview' => ['sheets' => $workbook['sheets'], 'sheet' => $workbook['sheet'], 'revision' => 0],
                 'expires_at' => now()->addDay(),
-            ]);
-        } catch (Throwable $exception) {
-            Storage::disk('local')->delete($path);
-
-            throw $exception;
-        }
+            ], $id);
+        });
 
         $sheet = $workbook['sheet'];
         $mapping = (array) $sheet['mapping'];
@@ -67,7 +64,7 @@ class SupplierStockImports
         return $this->drafts->lock($id, function () use ($owner, $id, $sheet): array {
             $batch = $this->draft($owner, $id);
 
-            return $this->workbook->worksheet(Storage::disk('local')->path($batch->file_path), $sheet);
+            return $this->storage->readWorkbook($batch->file_path, fn (string $path) => $this->workbook->worksheet($path, $sheet));
         });
     }
 
@@ -75,7 +72,7 @@ class SupplierStockImports
     {
         return $this->drafts->lock($id, function () use ($owner, $id, $sheet, $header, $mapping): InventoryImport {
             $batch = $this->draft($owner, $id);
-            $data = $this->workbook->extract(Storage::disk('local')->path($batch->file_path), $sheet, $header, $mapping);
+            $data = $this->storage->readWorkbook($batch->file_path, fn (string $path) => $this->workbook->extract($path, $sheet, $header, $mapping));
             $rows = $this->mappedRows($batch, $data['rows'], $this->catalog());
             $batch->setRelation('rows', $rows)->fill([
                 'status' => 'review',
@@ -320,25 +317,21 @@ class SupplierStockImports
 
     private function approveLocked(User $owner, string $id, int $revision, bool $acknowledged): array
     {
-        $workbookPath = null;
-        $batch = $this->commitTransaction(function () use ($owner, $id, $revision, $acknowledged, &$workbookPath): InventoryImport {
-            $batch = $this->draft($owner, $id, 'review');
-            abort_unless($revision === $batch->preview['revision'], 409, 'The review changed. Reload the import and verify the latest preview.');
-            $workbookPath = $batch->file_path;
+        $draft = $this->draft($owner, $id, 'review');
+        abort_unless($revision === $draft->preview['revision'], 409, 'The review changed. Reload the import and verify the latest preview.');
+        $workbookCosts = $this->savedWorkbookCosts($draft);
+        $batch = $this->commitTransaction(function () use ($owner, $id, $draft, $acknowledged, $workbookCosts): InventoryImport {
+            $this->protectStagedWorkbook($id, $draft->file_path);
             Product::lockCatalogWrites();
-            $source = hash('sha256', $batch->file_hash.'|'.$batch->preview['sheet_index']);
+            $source = hash('sha256', $draft->file_hash.'|'.$draft->preview['sheet_index']);
             $this->requireUnusedSource($source);
 
-            return $this->commitReviewed($batch, $owner, $source, $acknowledged, $this->savedWorkbookCosts($batch));
+            $batch = clone $draft;
+            $batch->setRelation('rows', $draft->getRelation('rows')->map(fn (InventoryImportRow $row) => clone $row));
+
+            return $this->commitReviewed($batch, $owner, $source, $acknowledged, $workbookCosts);
         });
-        try {
-            $this->drafts->forget($id);
-            if ($workbookPath !== null) {
-                Storage::disk('local')->delete($workbookPath);
-            }
-        } catch (Throwable $exception) {
-            report($exception);
-        }
+        $this->drafts->forget($id);
 
         return $batch->result;
     }
@@ -362,55 +355,101 @@ class SupplierStockImports
         $header = (int) $data['header'];
         $workbook = $this->workbook->extract($path, $sheet, $header, $mapping);
         $source = hash('sha256', $fileHash.'|'.$sheet);
+        $id = strtolower($data['draft_id']);
+        $archive = $this->storage->usesSupabase() ? InventoryImportStorage::CONFIRMED_DIRECTORY."/{$id}-{$fileHash}.xlsx" : null;
 
-        return $this->commitTransaction(function () use ($owner, $file, $data, $workbook, $fileHash, $mapping, $sheet, $header, $source): InventoryImport {
-            Product::lockCatalogWrites();
-            $previous = InventoryImport::find($data['draft_id']);
-            if ($previous !== null) {
-                abort_unless($previous->user_id === $owner->id && $previous->confirmed_at !== null
-                    && $previous->approved_source === $source, 409, 'This import reference is already in use.');
-
-                return $previous;
-            }
-            $this->requireUnusedSource($source);
-
-            $batch = (new InventoryImport([
-                'user_id' => $owner->id,
-                'file_name' => mb_substr($file->getClientOriginalName(), 0, 255),
-                'file_hash' => $fileHash,
-                'status' => 'review',
-                'worksheet_name' => $workbook['sheet'],
-                'preview' => ['sheet_index' => $sheet, 'header' => $header, 'mapping' => $mapping, 'item_cost_checked' => true],
-                'expires_at' => now()->addDay(),
-            ]))->forceFill(['id' => $data['draft_id']]);
-            $products = $this->catalog()->keyBy('id');
-            $categories = Category::pluck('id')->flip();
-            $rows = $this->mappedRows($batch, $workbook['rows'], $products);
-            $reviews = collect($data['rows'])->keyBy('row_number');
-
-            if ($reviews->count() !== $rows->count() || $rows->contains(fn (InventoryImportRow $row) => ! $reviews->has($row->row_number))) {
-                throw ValidationException::withMessages(['rows' => 'The reviewed rows differ from the workbook. Check the worksheet and column settings.']);
-            }
-            foreach ($rows as $row) {
-                $decision = $reviews[$row->row_number];
-                $product = $decision['decision'] === 'existing' ? $products->get($decision['product_id']) : null;
-                if ($decision['decision'] === 'existing') {
-                    if ($product === null || $product->trashed()) {
-                        $this->invalid($row, 'The matched product is no longer active. Review this match.');
-                    }
-                    if (Money::centavos($decision['reviewed_catalog_price']) !== Money::centavos($product->price)) {
-                        $this->invalid($row, 'The current selling price changed. Review the price decision again.');
-                    }
+        $confirm = function () use ($owner, $file, $data, $workbook, $fileHash, $mapping, $sheet, $header, $source, $id, $archive): array {
+            if ($archive !== null) {
+                $previous = $this->confirmedWorkbook($owner, $id, $source);
+                if ($previous !== null) {
+                    return $previous->result;
                 }
-                if (isset($decision['category_id']) && ! $categories->has($decision['category_id'])) {
-                    $this->invalid($row, 'The selected category is no longer available.');
-                }
-                $this->applyReview($row, $decision, $product);
+                $this->requireUnusedSource($source);
+                $this->storage->saveWorkbook($file, $archive);
             }
-            $batch->setRelation('rows', $rows);
 
-            return $this->commitReviewed($batch, $owner, $source, true, []);
-        })->result;
+            return $this->commitTransaction(function () use ($owner, $file, $data, $workbook, $fileHash, $mapping, $sheet, $header, $source, $id, $archive): InventoryImport {
+                $this->protectStagedWorkbook($id, $archive);
+                Product::lockCatalogWrites();
+                $previous = $this->confirmedWorkbook($owner, $id, $source);
+                if ($previous !== null) {
+                    return $previous;
+                }
+                $this->requireUnusedSource($source);
+
+                $batch = (new InventoryImport([
+                    'user_id' => $owner->id,
+                    'file_name' => mb_substr($file->getClientOriginalName(), 0, 255),
+                    'file_path' => $archive,
+                    'file_hash' => $fileHash,
+                    'status' => 'review',
+                    'worksheet_name' => $workbook['sheet'],
+                    'preview' => ['sheet_index' => $sheet, 'header' => $header, 'mapping' => $mapping, 'item_cost_checked' => true],
+                    'expires_at' => now()->addDay(),
+                ]))->forceFill(['id' => $id]);
+                $this->reviewWorkbookRows($batch, $workbook['rows'], $data['rows']);
+
+                return $this->commitReviewed($batch, $owner, $source, true, []);
+            })->result;
+        };
+
+        return $archive === null ? $confirm() : $this->drafts->lock($id, $confirm);
+    }
+
+    private function confirmedWorkbook(User $owner, string $id, string $source): ?InventoryImport
+    {
+        $previous = InventoryImport::find($id);
+        if ($previous !== null) {
+            abort_unless($previous->user_id === $owner->id && $previous->confirmed_at !== null
+                && $previous->approved_source === $source, 409, 'This import reference is already in use.');
+        }
+
+        return $previous;
+    }
+
+    private function reviewWorkbookRows(InventoryImport $batch, array $sourceRows, array $decisions): void
+    {
+        $products = $this->catalog()->keyBy('id');
+        $categories = Category::pluck('id')->flip();
+        $rows = $this->mappedRows($batch, $sourceRows, $products);
+        $reviews = collect($decisions)->keyBy('row_number');
+
+        if ($reviews->count() !== $rows->count() || $rows->contains(fn (InventoryImportRow $row) => ! $reviews->has($row->row_number))) {
+            throw ValidationException::withMessages(['rows' => 'The reviewed rows differ from the workbook. Check the worksheet and column settings.']);
+        }
+        foreach ($rows as $row) {
+            $decision = $reviews[$row->row_number];
+            $product = $decision['decision'] === 'existing' ? $products->get($decision['product_id']) : null;
+            if ($decision['decision'] === 'existing') {
+                if ($product === null || $product->trashed()) {
+                    $this->invalid($row, 'The matched product is no longer active. Review this match.');
+                }
+                if (Money::centavos($decision['reviewed_catalog_price']) !== Money::centavos($product->price)) {
+                    $this->invalid($row, 'The current selling price changed. Review the price decision again.');
+                }
+            }
+            if (isset($decision['category_id']) && ! $categories->has($decision['category_id'])) {
+                $this->invalid($row, 'The selected category is no longer available.');
+            }
+            $this->applyReview($row, $decision, $product);
+        }
+        $batch->setRelation('rows', $rows);
+    }
+
+    private function protectStagedWorkbook(string $id, ?string $path): void
+    {
+        if ($path !== null && $this->storage->usesSupabase()) {
+            $this->lockWorkbook($id);
+            abort_unless($this->storage->disk()->fileExists($path), 503, 'The workbook could not be found in storage. Upload it again.');
+        }
+    }
+
+    private function lockWorkbook(string $id): void
+    {
+        if (DB::getDriverName() === 'pgsql') {
+            // Keep the final existence check and commit exclusive with orphan deletion for this file.
+            DB::selectOne('select pg_advisory_xact_lock(hashtextextended(?, 0))', ['pos-import-workbook:'.strtolower($id)]);
+        }
     }
 
     private function commitTransaction(callable $callback): InventoryImport
@@ -455,9 +494,6 @@ class SupplierStockImports
             throw ValidationException::withMessages(['warnings' => 'Review and acknowledge the workbook warnings before approving.']);
         }
         $plans = $this->validateApproval($rows->where('decision', '!=', 'skip'), $products, $locked, $categories, $workbookCosts);
-        if ($batch->file_path !== null) {
-            $this->drafts->markConfirmationStarted($batch->id);
-        }
         $batch = $this->persistDraft($batch, $source);
         $entries = $this->apply($batch, $owner, $rows->sortBy('row_number'), $locked, $plans, $categoryReviews, $workbookCosts);
         $changedPrices = collect($entries)->filter(fn (array $entry) => $entry['previous_price'] !== null
@@ -483,7 +519,7 @@ class SupplierStockImports
         if ($batch->exists) {
             $batch->rows()->delete();
         }
-        $batch->forceFill([...$draft->getAttributes(), 'file_path' => null, 'approved_source' => $source])->save();
+        $batch->forceFill([...$draft->getAttributes(), 'approved_source' => $source])->save();
 
         return $batch;
     }
@@ -506,48 +542,191 @@ class SupplierStockImports
     {
         $this->drafts->lock($id, function () use ($owner, $id): void {
             $batch = $this->draft($owner, $id);
-            $path = $batch->file_path;
-            $batch->fill(['status' => 'cancelled', 'file_path' => null]);
+            $batch->status = 'cancelled';
             $this->drafts->save($batch);
-            if ($path !== null) {
-                Storage::disk('local')->delete($path);
+            if ($batch->file_path !== null && $this->discardUncommittedWorkbook($id, $batch->file_path)) {
+                $batch->file_path = null;
+                try {
+                    $this->drafts->save($batch);
+                } catch (Throwable $exception) {
+                    report($exception);
+                }
             }
         });
     }
 
-    public function prune(): void
+    public function previewPrune(): array
+    {
+        $files = [];
+        $disk = $this->storage->disk();
+        $addFile = function (string $path, string $reason) use ($disk, &$files): void {
+            if (! isset($files[$path]) && $disk->fileExists($path)) {
+                $files[$path] = $reason;
+            }
+        };
+
+        foreach ($this->expiredDrafts() as $draft) {
+            if ($draft->file_path !== null && ! $this->isCommittedWorkbook($draft->file_path)) {
+                $addFile($draft->file_path, 'Workbook for an expired draft');
+            }
+            foreach ($this->drafts->metadataPaths($draft->id) as $path) {
+                $addFile($path, 'Metadata for an expired draft');
+            }
+        }
+
+        foreach ($this->expirableWorkbookRecords()->lazyById(50) as $batch) {
+            if ($this->canRemoveStoredWorkbook($batch) && ! $this->isCommittedWorkbook($batch->file_path)) {
+                $reason = $batch->status === 'cancelled' ? 'Workbook for a cancelled import' : 'Workbook for an expired import';
+                $addFile($batch->file_path, $reason);
+            }
+        }
+
+        $cutoff = now()->subDay()->getTimestamp();
+        foreach ($this->orphanCandidates($cutoff, preview: true) as [$id, $path]) {
+            if (! isset($files[$path]) && $this->isOrphanedWorkbook($id, $path, $cutoff, preview: true)) {
+                $files[$path] = 'At least 24 hours old and unreferenced by any retained import or draft';
+            }
+        }
+
+        ksort($files);
+
+        return ['files' => $files, 'expired_previews' => $this->expiredPreviewRecords()->count()];
+    }
+
+    public function prune(): array
+    {
+        $failed = [];
+        foreach ($this->expiredDrafts() as $draft) {
+            $failure = $this->drafts->lock($draft->id, function () use ($draft): ?string {
+                $batch = $this->drafts->find($draft->id);
+                if (! $batch?->expires_at->isPast()) {
+                    return null;
+                }
+                if ($batch->file_path !== null && ! $this->discardUncommittedWorkbook($batch->id, $batch->file_path)) {
+                    return $batch->file_path;
+                }
+
+                return $this->drafts->forget($batch->id);
+            });
+            if ($failure !== null) {
+                $failed[] = $failure;
+            }
+        }
+
+        $this->expiredPreviewRecords()->delete();
+        foreach ($this->expirableWorkbookRecords()->lazyById(50) as $item) {
+            $batch = DB::transaction(function () use ($item): ?InventoryImport {
+                $batch = InventoryImport::lockForUpdate()->find($item->id);
+                if ($batch === null || ! $this->canRemoveStoredWorkbook($batch)) {
+                    return null;
+                }
+                if (in_array($batch->status, ['uploaded', 'review'], true)) {
+                    $batch->update(['status' => 'expired']);
+                }
+
+                return $batch;
+            }, 5);
+            if ($batch === null) {
+                continue;
+            }
+            if ($this->discardUncommittedWorkbook($batch->id, $batch->file_path)) {
+                InventoryImport::whereKey($batch->id)->whereNull('confirmed_at')
+                    ->where('file_path', $batch->file_path)->update(['file_path' => null]);
+            } else {
+                $failed[] = $batch->file_path;
+            }
+        }
+
+        $cutoff = now()->subDay()->getTimestamp();
+        foreach ($this->orphanCandidates($cutoff) as [$id, $path]) {
+            $removed = $this->drafts->lock($id, function () use ($id, $path, $cutoff): bool {
+                return DB::transaction(function () use ($id, $path, $cutoff): bool {
+                    $this->lockWorkbook($id);
+
+                    return ! $this->isOrphanedWorkbook($id, $path, $cutoff) || $this->storage->tryDelete($path);
+                });
+            });
+            if (! $removed) {
+                $failed[] = $path;
+            }
+        }
+
+        return array_values(array_unique($failed));
+    }
+
+    private function expiredDrafts(): iterable
     {
         foreach ($this->drafts->all() as $draft) {
             if ($draft->expires_at->isPast()) {
-                $this->drafts->lock($draft->id, function () use ($draft): void {
-                    $batch = $this->drafts->find($draft->id);
-                    if ($batch?->expires_at->isPast()) {
-                        if ($batch->file_path !== null) {
-                            Storage::disk('local')->delete($batch->file_path);
-                        }
-                        $this->drafts->forget($batch->id);
-                    }
-                });
+                yield $draft;
             }
         }
-        InventoryImport::whereNull('status')->whereNull('confirmed_at')->where('expires_at', '<=', now())->delete();
-        InventoryImport::whereNotNull('file_path')->where(function ($query): void {
-            $query->whereIn('status', ['cancelled', 'approved', 'expired'])->orWhere('expires_at', '<=', now());
-        })->chunkById(50, function (Collection $batches): void {
-            foreach ($batches as $item) {
-                $batch = DB::transaction(function () use ($item): InventoryImport {
-                    $batch = InventoryImport::lockForUpdate()->findOrFail($item->id);
-                    if (in_array($batch->status, ['uploaded', 'review'], true) && $batch->expires_at->isPast()) {
-                        $batch->update(['status' => 'expired']);
-                    }
+    }
 
-                    return $batch;
-                }, 5);
-                if (in_array($batch->status, ['cancelled', 'approved', 'expired'], true)) {
-                    $this->removeFile($batch);
-                }
-            }
+    private function expiredPreviewRecords(): Builder
+    {
+        return InventoryImport::whereNull('status')->whereNull('confirmed_at')->where('expires_at', '<=', now());
+    }
+
+    private function expirableWorkbookRecords(): Builder
+    {
+        return InventoryImport::whereNull('confirmed_at')->whereNotNull('file_path')->where(function (Builder $query): void {
+            $query->whereIn('status', ['cancelled', 'expired'])->orWhere('expires_at', '<=', now());
         });
+    }
+
+    private function canRemoveStoredWorkbook(InventoryImport $batch): bool
+    {
+        return $batch->confirmed_at === null && $batch->file_path !== null
+            && (in_array($batch->status, ['cancelled', 'expired'], true)
+                || (in_array($batch->status, ['uploaded', 'review'], true) && $batch->expires_at->isPast()));
+    }
+
+    private function isCommittedWorkbook(string $path): bool
+    {
+        return InventoryImport::whereNotNull('confirmed_at')->where('file_path', $path)->exists();
+    }
+
+    private function discardUncommittedWorkbook(string $id, string $path): bool
+    {
+        return DB::transaction(function () use ($id, $path): bool {
+            $this->lockWorkbook($id);
+
+            return $this->isCommittedWorkbook($path) || $this->storage->tryDelete($path);
+        });
+    }
+
+    private function orphanCandidates(int $cutoff, bool $preview = false): iterable
+    {
+        foreach ($this->storage->oldWorkbookPaths($cutoff) as $path) {
+            if (! preg_match('/^([a-f0-9-]{36})(?:-[a-f0-9]{64})?\.xlsx$/D', basename($path), $matches) || ! Str::isUuid($matches[1])) {
+                continue;
+            }
+            $id = $matches[1];
+            if (! $this->retainedWorkbookReferences($path, $preview)->whereKey($id)->exists()) {
+                yield [$id, $path];
+            }
+        }
+    }
+
+    private function retainedWorkbookReferences(string $path, bool $preview): Builder
+    {
+        $references = InventoryImport::where('file_path', $path);
+        if ($preview) {
+            $references->whereNotIn('id', $this->expiredPreviewRecords()->select('id'));
+        }
+
+        return $references;
+    }
+
+    private function isOrphanedWorkbook(string $id, string $path, int $cutoff, bool $preview = false): bool
+    {
+        if ($this->retainedWorkbookReferences($path, $preview)->exists() || $this->drafts->find($id)?->file_path === $path) {
+            return false;
+        }
+        $disk = $this->storage->disk();
+
+        return $disk->fileExists($path) && $disk->lastModified($path) <= $cutoff;
     }
 
     private function validateApproval(Collection $rows, Collection $catalog, Collection $locked, array $categories, array $workbookCosts): array
@@ -756,12 +935,12 @@ class SupplierStockImports
         $setup = $batch->preview ?? [];
         if ($batch->status !== 'review' || $batch->expires_at->isPast() || ($setup['item_cost_checked'] ?? false)
             || isset($setup['mapping']['unit_cost']) || ! isset($setup['sheet_index'], $setup['header'])
-            || ! $batch->file_path || ! Storage::disk('local')->exists($batch->file_path)) {
+            || ! $batch->file_path || ! $this->storage->disk()->fileExists($batch->file_path)) {
             return [];
         }
 
         try {
-            return $this->workbook->itemCosts(Storage::disk('local')->path($batch->file_path), $setup['sheet_index'], $setup['header']);
+            return $this->storage->readWorkbook($batch->file_path, fn (string $path) => $this->workbook->itemCosts($path, $setup['sheet_index'], $setup['header']));
         } catch (ValidationException) {
             return [];
         }
@@ -892,15 +1071,12 @@ class SupplierStockImports
 
     private function findBatch(string $id): InventoryImport
     {
-        $draft = $this->drafts->find($id);
-        if ($draft === null) {
-            return InventoryImport::findOrFail($id);
-        }
-        if ($this->drafts->confirmationStarted($id)) {
-            return InventoryImport::whereNotNull('confirmed_at')->find($id) ?? $draft;
+        $stored = InventoryImport::find($id);
+        if ($stored?->confirmed_at !== null) {
+            return $stored;
         }
 
-        return $draft;
+        return $this->drafts->find($id) ?? $stored ?? abort(404);
     }
 
     private function needsPriceReview(InventoryImportRow $row, ?Product $product): bool
@@ -908,17 +1084,6 @@ class SupplierStockImports
         return ! in_array($row->source['price_decision'] ?? null, ['keep', 'change'], true)
             || $product === null || $product->trashed()
             || ($row->source['reviewed_catalog_price'] ?? null) !== $product->price;
-    }
-
-    private function removeFile(InventoryImport $batch): void
-    {
-        try {
-            if ($batch->file_path && Storage::disk('local')->delete($batch->file_path)) {
-                $batch->update(['file_path' => null]);
-            }
-        } catch (Throwable $exception) {
-            report($exception);
-        }
     }
 
     private function invalid(InventoryImportRow $row, string $message): never
